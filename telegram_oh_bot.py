@@ -51,6 +51,9 @@ LOCAL_UPLOAD_DIR = os.environ.get("LOCAL_UPLOAD_DIR", "/tmp/tg-bot-uploads")
 SANDBOX_UPLOAD_DIR = os.environ.get("SANDBOX_UPLOAD_DIR", "/workspace/project/uploads")
 EVENTS_LIMIT = int(os.environ.get("EVENTS_LIMIT", "100"))
 STATE_DB = os.environ.get("BOT_STATE_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_state.sqlite3"))
+HEALTH_GRACE_SECONDS = float(os.environ.get("HEALTH_GRACE_SECONDS", "180"))
+HEALTH_FRESH_SECONDS = float(os.environ.get("HEALTH_FRESH_SECONDS", "180"))
+HEALTH_DOWN_AFTER_SECONDS = float(os.environ.get("HEALTH_DOWN_AFTER_SECONDS", "600"))
 
 # Shown in Telegram's command menu, so the user can tap instead of typing.
 BOT_COMMANDS = [
@@ -471,6 +474,7 @@ class Bot:
         self.reply_timeout = float(os.environ.get("REPLY_TIMEOUT", "900"))
         self.idle_timeout = float(os.environ.get("IDLE_CLOSE_MINUTES", "60")) * 60
         self.poll_interval = float(os.environ.get("REPLY_POLL_SECONDS", "1"))
+        self.poll_timeout = float(os.environ.get("POLL_TIMEOUT_SECONDS", "50"))
         self.show_tools = os.environ.get("SHOW_TOOL_UPDATES", "1") not in ("0", "false", "False")
         self.upload_dir = LOCAL_UPLOAD_DIR
         self._queues: dict[int, queue.Queue] = {}
@@ -479,6 +483,8 @@ class Bot:
         self.bot_username: str | None = os.environ.get("BOT_USERNAME", "").strip() or None
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._last_poll_ok = 0.0
+        self._booted_at = time.time()
 
     # ---------- telegram plumbing ----------
 
@@ -860,24 +866,38 @@ class Bot:
 
     # ---------- main loop ----------
 
-    def _health_server(self) -> None:
-        """Minimal HTTP endpoint so free PaaS hosts see a bound port and keep the bot alive."""
-        port = int(os.environ.get("PORT", "0") or 0)
-        if not port:
-            return
+    def _health_handler(self):
+        """Build the request handler class, separate from serving so it stays testable."""
         bot = self
 
         class Handler(BaseHTTPRequestHandler):
-            def _payload(self) -> bytes:
-                return json.dumps({
-                    "ok": True,
+            def _state(self) -> tuple[bool, dict]:
+                # A bound port only proves the process is up. Report whether the
+                # bot can actually reach Telegram, so a revoked token or a dead
+                # polling loop does not look healthy forever.
+                now = time.time()
+                since = (now - bot._last_poll_ok) if bot._last_poll_ok else None
+                starting = (now - bot._booted_at) < HEALTH_GRACE_SECONDS
+                fresh = since is not None and since < HEALTH_FRESH_SECONDS
+                healthy = starting or fresh
+                # Fail the HTTP status only on a sustained outage: a brief blip
+                # must not flip the monitor red, and a slow boot must not fail
+                # the host's own health check.
+                sustained = since is None or since >= HEALTH_DOWN_AFTER_SECONDS
+                http_ok = healthy or not sustained
+                return http_ok, {
+                    "ok": healthy,
+                    "telegram": "connected" if fresh else "not connected",
+                    "last_poll_seconds_ago": int(since) if since is not None else None,
+                    "starting": starting,
                     "chats": len(bot.store.all_chats()),
                     "idle_close_minutes": int(bot.idle_timeout // 60),
-                }).encode()
+                }
 
             def _reply(self, with_body: bool) -> None:
-                body = self._payload()
-                self.send_response(200)
+                http_ok, payload = self._state()
+                body = json.dumps(payload).encode()
+                self.send_response(200 if http_ok else 503)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -893,8 +913,15 @@ class Bot:
             def log_message(self, *_args):
                 pass
 
+        return Handler
+
+    def _health_server(self) -> None:
+        """Minimal HTTP endpoint so free PaaS hosts see a bound port and keep the bot alive."""
+        port = int(os.environ.get("PORT", "0") or 0)
+        if not port:
+            return
         try:
-            ThreadingHTTPServer(("0.0.0.0", port), Handler).serve_forever()
+            ThreadingHTTPServer(("0.0.0.0", port), self._health_handler()).serve_forever()
         except OSError as exc:
             log("health server failed:", exc)
 
@@ -908,6 +935,8 @@ class Bot:
                 self.bot_username = me["result"].get("username")
                 log("bot:", self.bot_username)
                 self.tg.set_commands(BOT_COMMANDS)
+            else:
+                log("getMe returned not-ok:", me)
         except Exception as exc:  # noqa: BLE001 - keep serving so the port stays up
             log("getMe failed:", exc)
         offset = int(self.store.kv_get("update_offset", "0") or 0)
@@ -919,7 +948,8 @@ class Bot:
         log("polling started, offset =", offset, "idle close after", int(self.idle_timeout // 60), "min")
         while not self._stop.is_set():
             try:
-                updates = self.tg.get_updates(offset)
+                updates = self.tg.get_updates(offset, timeout=int(self.poll_timeout))
+                self._last_poll_ok = time.time()
             except Exception as exc:  # noqa: BLE001 - transient network errors must not stop the bot
                 log("getUpdates failed:", exc)
                 time.sleep(5)
